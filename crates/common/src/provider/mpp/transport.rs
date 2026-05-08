@@ -19,6 +19,7 @@ use std::{
     collections::HashMap,
     env, fmt, io,
     io::IsTerminal,
+    path::{Component, Path, PathBuf},
     process::{Command, Stdio},
     sync::{
         Arc, LazyLock, Mutex,
@@ -145,8 +146,52 @@ fn can_run_interactive_tempo_fund() -> bool {
     )
 }
 
+fn is_safe_command_name(candidate: &str) -> bool {
+    if candidate.trim().is_empty() {
+        return false;
+    }
+
+    let mut components = Path::new(candidate).components();
+    matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
+}
+
 fn tempo_bin() -> String {
-    std::env::var("TEMPO_BIN").unwrap_or_else(|_| "tempo".to_string())
+    std::env::var("TEMPO_BIN")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| is_safe_command_name(value))
+        .unwrap_or_else(|| "tempo".to_string())
+}
+
+#[cfg(windows)]
+fn command_search_candidates(dir: &Path, command: &str) -> Vec<PathBuf> {
+    let base = dir.join(command);
+    if base.extension().is_some() {
+        return vec![base];
+    }
+
+    let mut candidates = Vec::with_capacity(5);
+    candidates.push(base);
+    for ext in [".com", ".exe", ".bat", ".cmd"] {
+        candidates.push(dir.join(format!("{command}{ext}")));
+    }
+    candidates
+}
+
+#[cfg(not(windows))]
+fn command_search_candidates(dir: &Path, command: &str) -> Vec<PathBuf> {
+    vec![dir.join(command)]
+}
+
+fn resolve_command_from_path(command: &str) -> Option<PathBuf> {
+    let path = env::var_os("PATH")?;
+    env::split_paths(&path)
+        .flat_map(|dir| command_search_candidates(&dir, command))
+        .find(|candidate| candidate.is_file())
+}
+
+fn resolve_tempo_bin() -> Option<PathBuf> {
+    resolve_command_from_path(&tempo_bin())
 }
 
 async fn run_interactive_tempo_fund(ctx: &FundingContext) -> TransportResult<bool> {
@@ -154,7 +199,12 @@ async fn run_interactive_tempo_fund(ctx: &FundingContext) -> TransportResult<boo
         return Ok(false);
     }
 
-    let tempo = tempo_bin();
+    let tempo = resolve_tempo_bin().ok_or_else(|| {
+        TransportErrorKind::custom(std::io::Error::other(format!(
+            "failed to locate safe `tempo` executable on PATH{}",
+            tempo_wallet_fund_help(ctx)
+        )))
+    })?;
     let mut args = vec!["wallet".to_string(), "fund".to_string()];
     if let Some(address) = ctx.wallet_address {
         args.push("--address".to_string());
@@ -1537,6 +1587,67 @@ mod tests {
         assert!(!interactive_tempo_fund_allowed(Some("1"), false, true, true));
         assert!(!interactive_tempo_fund_allowed(Some("true"), false, true, true));
         assert!(interactive_tempo_fund_allowed(None, false, true, true));
+    }
+
+    #[test]
+    fn tempo_bin_rejects_path_like_env_overrides() {
+        let _g = crate::tempo::test_env_mutex().blocking_lock();
+
+        unsafe {
+            std::env::set_var("TEMPO_BIN", "./malicious-binary");
+        }
+        assert_eq!(tempo_bin(), "tempo");
+
+        unsafe {
+            std::env::set_var("TEMPO_BIN", "nested/tempo");
+        }
+        assert_eq!(tempo_bin(), "tempo");
+
+        unsafe {
+            std::env::set_var("TEMPO_BIN", "tempo-dev");
+        }
+        assert_eq!(tempo_bin(), "tempo-dev");
+
+        unsafe {
+            std::env::remove_var("TEMPO_BIN");
+        }
+    }
+
+    #[test]
+    fn tempo_bin_resolution_ignores_current_directory() {
+        let _g = crate::tempo::test_env_mutex().blocking_lock();
+        let cwd = std::env::current_dir().unwrap();
+        let current_dir = tempfile::tempdir().unwrap();
+        let path_dir = tempfile::tempdir().unwrap();
+        let old_path = std::env::var_os("PATH");
+        let old_tempo_bin = std::env::var_os("TEMPO_BIN");
+
+        std::fs::write(current_dir.path().join("tempo"), b"repo-local").unwrap();
+        std::fs::write(path_dir.path().join("tempo"), b"path-bin").unwrap();
+        #[cfg(windows)]
+        {
+            std::fs::write(current_dir.path().join("tempo.exe"), b"repo-local").unwrap();
+            std::fs::write(path_dir.path().join("tempo.exe"), b"path-bin").unwrap();
+        }
+
+        std::env::set_current_dir(current_dir.path()).unwrap();
+        unsafe {
+            std::env::set_var("PATH", path_dir.path());
+            std::env::remove_var("TEMPO_BIN");
+        }
+
+        let resolved = resolve_tempo_bin().expect("tempo should resolve from PATH");
+        assert_eq!(resolved.parent(), Some(path_dir.path()));
+
+        std::env::set_current_dir(cwd).unwrap();
+        match old_path {
+            Some(path) => unsafe { std::env::set_var("PATH", path) },
+            None => unsafe { std::env::remove_var("PATH") },
+        }
+        match old_tempo_bin {
+            Some(path) => unsafe { std::env::set_var("TEMPO_BIN", path) },
+            None => unsafe { std::env::remove_var("TEMPO_BIN") },
+        }
     }
 
     #[tokio::test]
