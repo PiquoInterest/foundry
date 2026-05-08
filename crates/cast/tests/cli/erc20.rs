@@ -15,6 +15,7 @@ mod anvil_const {
 
     /// Contract address deploying from ADDR1 with nonce 0
     pub const TOKEN: &str = "0x5FbDB2315678afecb367f032d93F642f64180aa3";
+
 }
 
 fn get_u256_from_cmd(cmd: &mut foundry_test_utils::TestCommand, args: &[&str]) -> U256 {
@@ -65,11 +66,12 @@ fn deploy_test_token(
 }
 
 /// Helper to setup anvil node and deploy test token
-async fn setup_token_test(
+async fn setup_token_test_with_node(
     prj: &foundry_test_utils::TestProject,
     cmd: &mut foundry_test_utils::TestCommand,
+    node_config: NodeConfig,
 ) -> (String, String, NodeHandle) {
-    let (_, handle) = anvil::spawn(NodeConfig::test()).await;
+    let (_, handle) = anvil::spawn(node_config).await;
     let rpc = handle.http_endpoint();
 
     // Deploy TestToken contract
@@ -78,6 +80,14 @@ async fn setup_token_test(
     let token = deploy_test_token(cmd, &rpc, anvil_const::PK1);
 
     (rpc, token, handle)
+}
+
+/// Helper to setup anvil node and deploy test token
+async fn setup_token_test(
+    prj: &foundry_test_utils::TestProject,
+    cmd: &mut foundry_test_utils::TestCommand,
+) -> (String, String, NodeHandle) {
+    setup_token_test_with_node(prj, cmd, NodeConfig::test()).await
 }
 
 // tests that `balance` and `transfer` commands works correctly
@@ -262,6 +272,49 @@ forgetest_async!(erc20_burn_success, |prj, cmd| {
         .stdout_lossy();
     let total_supply: U256 = output.split_whitespace().next().unwrap().parse().unwrap();
     assert_eq!(total_supply, initial_supply - burn_amount);
+});
+
+// tests that `--tempo.print-sponsor-hash` does not broadcast state-changing ERC20 operations
+forgetest_async!(erc20_print_sponsor_hash_does_not_send, |prj, cmd| {
+    let (rpc, token, _handle) = setup_token_test_with_node(&prj, &mut cmd, NodeConfig::test_tempo()).await;
+
+    let transfer_amount = U256::from(1_000_000_000_000_000_000u128);
+    let sender_balance_before = get_balance(&mut cmd, &token, anvil_const::ADDR1, &rpc);
+    let recipient_balance_before = get_balance(&mut cmd, &token, anvil_const::ADDR2, &rpc);
+
+    let output = cmd
+        .cast_fuse()
+        .args([
+            "erc20",
+            "transfer",
+            &token,
+            anvil_const::ADDR2,
+            &transfer_amount.to_string(),
+            "--rpc-url",
+            &rpc,
+            "--private-key",
+            anvil_const::PK1,
+            "--tempo.print-sponsor-hash",
+        ])
+        .assert_success()
+        .get_output()
+        .stdout_lossy();
+
+    let sponsor_hash = output.trim();
+    assert!(sponsor_hash.starts_with("0x"), "expected sponsor hash output, got: {output}");
+    assert_eq!(sponsor_hash.len(), 66, "expected 32-byte hash, got: {sponsor_hash}");
+
+    let sender_balance_after = get_balance(&mut cmd, &token, anvil_const::ADDR1, &rpc);
+    let recipient_balance_after = get_balance(&mut cmd, &token, anvil_const::ADDR2, &rpc);
+
+    assert_eq!(
+        sender_balance_after, sender_balance_before,
+        "sender balance changed even though --tempo.print-sponsor-hash should not send"
+    );
+    assert_eq!(
+        recipient_balance_after, recipient_balance_before,
+        "recipient balance changed even though --tempo.print-sponsor-hash should not send"
+    );
 });
 
 // tests that `transfer` command works with gas options

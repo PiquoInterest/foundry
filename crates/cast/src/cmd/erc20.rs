@@ -11,7 +11,7 @@ use alloy_ens::NameOrAddress;
 use alloy_network::{Ethereum, EthereumWallet, Network, TransactionBuilder};
 use alloy_primitives::{Address, U256};
 use alloy_provider::{Provider, fillers::RecommendedFillers};
-use alloy_signer::Signature;
+use alloy_signer::{Signature, Signer};
 use alloy_sol_types::sol;
 use clap::Parser;
 use foundry_cli::{
@@ -375,6 +375,20 @@ impl Erc20Subcommand {
                         &mut tx,
                         get_chain(config.chain, &$provider).await?.is_legacy(),
                     );
+                    tx.set_key_id(access_key.key_address);
+                    let chain = get_chain(config.chain, &$provider).await?;
+                    if maybe_print_sponsor_hash(
+                        &$provider,
+                        &mut tx,
+                        &$tx_opts,
+                        access_key.wallet_address,
+                        chain,
+                        0,
+                    )
+                    .await?
+                    {
+                        return Ok(());
+                    }
                     cast_send_with_access_key(
                         &$provider,
                         tx,
@@ -397,7 +411,26 @@ impl Erc20Subcommand {
                     if chain.is_tempo() && tx.fee_token().is_none() {
                         tx.set_fee_token(PATH_USD_ADDRESS);
                     }
-                    fill_tx(&$provider, &mut tx, browser.address(), chain).await?;
+                    if maybe_print_sponsor_hash(
+                        &$provider,
+                        &mut tx,
+                        &$tx_opts,
+                        browser.address(),
+                        chain,
+                        if chain.is_tempo() { TEMPO_BROWSER_GAS_BUFFER } else { 0 },
+                    )
+                    .await?
+                    {
+                        return Ok(());
+                    }
+                    fill_tx(
+                        &$provider,
+                        &mut tx,
+                        browser.address(),
+                        chain,
+                        if chain.is_tempo() { TEMPO_BROWSER_GAS_BUFFER } else { 0 },
+                    )
+                    .await?;
                     let tx_hash = browser.send_transaction_via_browser(tx).await?;
                     CastTxSender::new(&$provider)
                         .print_tx_result(
@@ -409,13 +442,24 @@ impl Erc20Subcommand {
                         .await?
                 } else {
                     let signer = pre_resolved_signer.unwrap_or($send_tx.eth.wallet.signer().await?);
+                    let from = signer.address();
                     let $provider = build_provider_with_signer::<N>(&$send_tx, signer)?;
                     let $erc20 = IERC20::new($token.resolve(&$provider).await?, &$provider);
                     let mut tx = { $build_tx }.into_transaction_request();
-                    $tx_opts.apply::<N>(
+                    let chain = get_chain(config.chain, &$provider).await?;
+                    $tx_opts.apply::<N>(&mut tx, chain.is_legacy());
+                    if maybe_print_sponsor_hash(
+                        &$provider,
                         &mut tx,
-                        get_chain(config.chain, &$provider).await?.is_legacy(),
-                    );
+                        &$tx_opts,
+                        from,
+                        chain,
+                        0,
+                    )
+                    .await?
+                    {
+                        return Ok(());
+                    }
                     cast_send(
                         $provider,
                         tx,
@@ -555,6 +599,29 @@ impl Erc20Subcommand {
     }
 }
 
+async fn maybe_print_sponsor_hash<N: Network, P: Provider<N>>(
+    provider: &P,
+    tx: &mut N::TransactionRequest,
+    tx_opts: &TxParams,
+    from: Address,
+    chain: Chain,
+    gas_buffer: u64,
+) -> eyre::Result<bool>
+where
+    N::TransactionRequest: FoundryTransactionBuilder<N>,
+{
+    if !tx_opts.tempo.print_sponsor_hash {
+        return Ok(false);
+    }
+
+    fill_tx(provider, tx, from, chain, gas_buffer).await?;
+    let hash = tx
+        .compute_sponsor_hash(from)
+        .ok_or_else(|| eyre::eyre!("This network does not support sponsored transactions"))?;
+    sh_println!("{hash:?}")?;
+    Ok(true)
+}
+
 /// Fills from, chain_id, nonce, fees, and gas limit on a transaction request for the browser
 /// wallet path. Mirrors the filling logic in the shared tx builder but operates on a
 /// pre-built transaction request from the sol! macro rather than through the builder pipeline.
@@ -564,6 +631,7 @@ async fn fill_tx<N: Network, P: Provider<N>>(
     tx: &mut N::TransactionRequest,
     from: Address,
     chain: Chain,
+    gas_buffer: u64,
 ) -> eyre::Result<()>
 where
     N::TransactionRequest: FoundryTransactionBuilder<N>,
@@ -593,13 +661,7 @@ where
 
     if tx.gas_limit().is_none() {
         let mut estimated = provider.estimate_gas(tx.clone()).await?;
-
-        // Browser wallets may sign with P256/WebAuthn instead of secp256k1, which
-        // costs more gas for signature verification on Tempo chains. Add a
-        // conservative buffer since we can't determine the signature type beforehand.
-        if chain.is_tempo() {
-            estimated += TEMPO_BROWSER_GAS_BUFFER;
-        }
+        estimated += gas_buffer;
 
         tx.set_gas_limit(estimated);
     }
