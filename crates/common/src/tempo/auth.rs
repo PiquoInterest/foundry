@@ -78,13 +78,39 @@ impl EnsureAccessKeyConfig {
     }
 }
 
+fn build_browser_url(service: &str, code: &str) -> Result<url::Url> {
+    let mut url = url::Url::parse(service)?;
+    url.query_pairs_mut().append_pair("code", code);
+    Ok(url)
+}
+
+fn build_service_path_url(service: &str, segments: &[&str]) -> Result<url::Url> {
+    let mut url = url::Url::parse(service)?;
+    let mut path = url
+        .path_segments_mut()
+        .map_err(|_| eyre::eyre!("device-code service URL must be hierarchical"))?;
+    for segment in segments {
+        path.push(segment);
+    }
+    drop(path);
+    Ok(url)
+}
+
+fn build_code_url(service: &str) -> Result<url::Url> {
+    build_service_path_url(service, &["code"])
+}
+
+fn build_poll_url(service: &str, code: &str) -> Result<url::Url> {
+    build_service_path_url(service, &["poll", code])
+}
+
 /// Open `url` via the OS default browser handler. On platforms without a known
 /// opener, this is a no-op (the URL is still printed by [`ensure_access_key`]).
 fn open_browser(_url: &str) {
     #[cfg(target_os = "macos")]
     let _ = Command::new("open").arg(_url).spawn();
     #[cfg(target_os = "windows")]
-    let _ = Command::new("cmd").args(["/c", "start", "", _url]).spawn();
+    let _ = Command::new("explorer").arg(_url).spawn();
     #[cfg(all(unix, not(target_os = "macos")))]
     let _ = Command::new("xdg-open").arg(_url).spawn();
 }
@@ -121,23 +147,26 @@ pub async fn ensure_access_key(cfg: EnsureAccessKeyConfig) -> Result<AccessKeyOu
         key_type: "secp256k1",
         pub_key: pub_key_hex,
     };
-    let code = create_code_with_retry(&client, service, &create_req, cfg.timeout).await?;
+    let code =
+        create_code_with_retry(&client, build_code_url(service)?, &create_req, cfg.timeout).await?;
 
-    let browser_url = format!("{service}?code={code}");
+    let browser_url = build_browser_url(service, &code)?;
     if cfg.no_browser {
-        let _ = crate::sh_eprintln!("Open this URL to authorize: {browser_url}");
+        let _ = crate::sh_eprintln!("Open this URL to authorize: {}", browser_url.as_str());
     } else {
         let _ = crate::sh_eprintln!(
-            "Opening wallet.tempo to authorize an access key…\n  {browser_url}"
+            "Opening wallet.tempo to authorize an access key…\n  {}",
+            browser_url.as_str()
         );
-        open_browser(&browser_url);
+        open_browser(browser_url.as_str());
     }
 
     let poll = PollRequest { code_verifier };
+    let poll_url = build_poll_url(service, &code)?;
     let started = Instant::now();
     loop {
         // Retry transient network/5xx/429 failures within `cfg.timeout`.
-        let send_res = client.post(format!("{service}/poll/{code}")).json(&poll).send().await;
+        let send_res = client.post(poll_url.clone()).json(&poll).send().await;
 
         let resp = match send_res {
             Ok(r) => r,
@@ -244,14 +273,14 @@ fn is_transient_status(status: reqwest::StatusCode) -> bool {
 /// POST `/code` with exponential backoff on transient errors, bounded by `timeout`.
 async fn create_code_with_retry(
     client: &reqwest::Client,
-    service: &str,
+    code_url: url::Url,
     req: &CreateCodeRequest,
     timeout: Duration,
 ) -> Result<String> {
     let started = Instant::now();
     let mut backoff = Duration::from_millis(500);
     loop {
-        let send_res = client.post(format!("{service}/code")).json(req).send().await;
+        let send_res = client.post(code_url.clone()).json(req).send().await;
 
         match send_res {
             Ok(resp) => {
@@ -341,6 +370,33 @@ mod tests {
         let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
         let challenge = sha256_b64url(verifier);
         assert_eq!(challenge, "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM");
+    }
+
+    #[test]
+    fn browser_url_percent_encodes_device_code() {
+        let browser_url =
+            build_browser_url("https://wallet.tempo.xyz/cli-auth", "abc&powershell -nop -c calc")
+                .unwrap();
+
+        assert_eq!(
+            browser_url.as_str(),
+            "https://wallet.tempo.xyz/cli-auth?code=abc%26powershell+-nop+-c+calc"
+        );
+        assert_eq!(
+            browser_url.query_pairs().find(|(key, _)| key == "code").map(|(_, value)| value),
+            Some("abc&powershell -nop -c calc".into())
+        );
+    }
+
+    #[test]
+    fn poll_url_percent_encodes_device_code_path_segment() {
+        let poll_url =
+            build_poll_url("https://wallet.tempo.xyz/cli-auth", "abc/../calc?x=1").unwrap();
+
+        assert_eq!(
+            poll_url.as_str(),
+            "https://wallet.tempo.xyz/cli-auth/poll/abc%2F..%2Fcalc%3Fx=1"
+        );
     }
 
     /// Recover the EOA from a SEC1-encoded public key (compressed or
