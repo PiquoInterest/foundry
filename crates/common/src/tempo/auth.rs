@@ -84,7 +84,7 @@ fn open_browser(_url: &str) {
     #[cfg(target_os = "macos")]
     let _ = Command::new("open").arg(_url).spawn();
     #[cfg(target_os = "windows")]
-    let _ = Command::new("cmd").args(["/c", "start", "", _url]).spawn();
+    let _ = Command::new("rundll32").args(["url.dll,FileProtocolHandler", _url]).spawn();
     #[cfg(all(unix, not(target_os = "macos")))]
     let _ = Command::new("xdg-open").arg(_url).spawn();
 }
@@ -123,7 +123,7 @@ pub async fn ensure_access_key(cfg: EnsureAccessKeyConfig) -> Result<AccessKeyOu
     };
     let code = create_code_with_retry(&client, service, &create_req, cfg.timeout).await?;
 
-    let browser_url = format!("{service}?code={code}");
+    let browser_url = authorization_url(service, &code)?;
     if cfg.no_browser {
         let _ = crate::sh_eprintln!("Open this URL to authorize: {browser_url}");
     } else {
@@ -137,7 +137,7 @@ pub async fn ensure_access_key(cfg: EnsureAccessKeyConfig) -> Result<AccessKeyOu
     let started = Instant::now();
     loop {
         // Retry transient network/5xx/429 failures within `cfg.timeout`.
-        let send_res = client.post(format!("{service}/poll/{code}")).json(&poll).send().await;
+        let send_res = client.post(poll_url(service, &code)?).json(&poll).send().await;
 
         let resp = match send_res {
             Ok(r) => r,
@@ -231,6 +231,20 @@ pub async fn ensure_access_key(cfg: EnsureAccessKeyConfig) -> Result<AccessKeyOu
             }
         }
     }
+}
+
+fn authorization_url(service: &str, code: &str) -> Result<String> {
+    let mut url = url::Url::parse(service)?;
+    url.query_pairs_mut().append_pair("code", code);
+    Ok(url.into())
+}
+
+fn poll_url(service: &str, code: &str) -> Result<String> {
+    let mut url = url::Url::parse(service)?;
+    url.path_segments_mut()
+        .map_err(|_| eyre::eyre!("device-code service URL cannot be a base"))?
+        .extend(["poll", code]);
+    Ok(url.into())
 }
 
 fn is_transient_error(err: &reqwest::Error) -> bool {
@@ -334,6 +348,23 @@ mod tests {
     use crate::tempo::{TEMPO_HOME_ENV, read_tempo_keys_file, test_env_mutex};
     use axum::{Json, Router, extract::State, routing::post};
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn auth_urls_escape_device_code_metacharacters() {
+        let code = r#"ABC&echo.PWNED>%TEMP%\foundry_tempo_poc.txt&rem|<"#;
+
+        let authorize = authorization_url("https://wallet.tempo.xyz/cli-auth", code).unwrap();
+        assert_eq!(
+            authorize,
+            "https://wallet.tempo.xyz/cli-auth?code=ABC%26echo.PWNED%3E%25TEMP%25%5Cfoundry_tempo_poc.txt%26rem%7C%3C"
+        );
+
+        let poll = poll_url("https://wallet.tempo.xyz/cli-auth", code).unwrap();
+        assert_eq!(
+            poll,
+            "https://wallet.tempo.xyz/cli-auth/poll/ABC&echo.PWNED%3E%25TEMP%25%5Cfoundry_tempo_poc.txt&rem|%3C"
+        );
+    }
 
     #[test]
     fn pkce_challenge_matches_sdk_format() {
