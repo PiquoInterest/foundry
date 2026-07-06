@@ -22,6 +22,7 @@ It helps enforce best practices and improve code quality within Foundry projects
 - **Medium Severity:**
   - `assert-state-change`: Flags state-modifying expressions inside `assert()` arguments.
   - `boolean-cst`: Flags misuse of boolean constants.
+  - `dangerous-unary-operator`: Flags an assignment whose `=` is fused to a unary operator (`=-`, `=~`), e.g. `x =- 1`, which parses as `x = -1` instead of the intended compound `x -= 1`.
   - `divide-before-multiply`: Warns against performing division before multiplication in the same expression, which can cause precision loss.
   - `incorrect-erc20-interface`: Flags ERC20 interfaces and implementations with non-compliant function signatures.
   - `incorrect-erc721-interface`: Flags ERC721 interfaces and implementations with non-compliant function signatures.
@@ -41,6 +42,7 @@ It helps enforce best practices and improve code quality within Foundry projects
   - `block-timestamp`: Warns when `block.timestamp` is used in a comparison, as it may be manipulated by validators.
   - `calls-loop`: External calls inside loops can cause denial-of-service if a call reverts or exhausts gas.
   - `delegatecall-loop`: Payable functions should not use `delegatecall` inside a loop.
+  - `empty-block`: Flags regular functions with an empty body; constructors, `receive`/`fallback`, `virtual` functions, functions with modifiers and value-less `payable` functions are exempt.
   - `incorrect-modifier`: Modifiers should not be able to finish without executing `_` or reverting.
   - `missing-events-access-control`: Access control changes should emit events.
   - `missing-zero-check`: Address parameter is used in a state write or value transfer without a zero-address check.
@@ -66,6 +68,7 @@ It helps enforce best practices and improve code quality within Foundry projects
   - `missing-inheritance`: Flags contracts that implement every external function of an interface without explicitly inheriting from it.
   - `low-level-calls`: Direct use of low-level calls should be avoided.
   - `event-fields`: `address` event parameters should be `indexed` for efficient log filtering.
+  - `unused-error`: Custom error declarations that are never referenced should be removed.
 - **Gas Optimizations:**
   - `asm-keccak256`: Recommends using inline assembly for `keccak256` for potential gas savings.
   - `cache-array-length`: Recommends caching storage dynamic array lengths used in `for` loop conditions.

@@ -11,11 +11,7 @@ use foundry_block_explorers::{
     utils::lookup_compiler_version,
 };
 use foundry_cli::utils::LoadConfig;
-use foundry_common::{
-    abi::encode_args,
-    compile::{PathOrContractInfo, ProjectCompiler},
-    find_matching_contract_artifact, ignore_metadata_hash, shell,
-};
+use foundry_common::{abi::encode_args, compile::ProjectCompiler, ignore_metadata_hash, shell};
 use foundry_compilers::artifacts::{BytecodeHash, CompactContractBytecode, EvmVersion};
 use foundry_config::Config;
 use foundry_evm::{
@@ -95,15 +91,6 @@ pub fn build_project(
     let project = config.project()?;
     let compiler = ProjectCompiler::new().quiet(true);
 
-    if args.contract.path.is_some() {
-        let contract = PathOrContractInfo::ContractInfo(args.contract.clone());
-        let target_path = project.root().join(contract.path().unwrap()).canonicalize()?;
-        let mut output = compiler.files([target_path.clone()]).compile(&project)?;
-        let artifact =
-            find_matching_contract_artifact(&mut output, &target_path, Some(&args.contract.name))?;
-        return Ok(artifact.into_contract_bytecode());
-    }
-
     let mut output = compiler.compile(&project)?;
 
     let artifact = output
@@ -117,7 +104,7 @@ pub fn print_result(
     res: Option<VerificationType>,
     bytecode_type: BytecodeType,
     json_results: &mut Vec<JsonResult>,
-    etherscan_config: &Metadata,
+    etherscan_metadata: Option<&Metadata>,
     config: &Config,
 ) {
     if let Some(res) = res {
@@ -135,9 +122,11 @@ pub fn print_result(
         let _ = sh_err!(
             "{bytecode_type:?} code did not match - this may be due to varying compiler settings"
         );
-        let mismatches = find_mismatch_in_settings(etherscan_config, config);
-        for mismatch in mismatches {
-            let _ = sh_eprintln!("{}", mismatch.red().bold());
+        if let Some(etherscan_metadata) = etherscan_metadata {
+            let mismatches = find_mismatch_in_settings(etherscan_metadata, config);
+            for mismatch in mismatches {
+                let _ = sh_eprintln!("{}", mismatch.red().bold());
+            }
         }
     } else {
         let json_res = JsonResult {
@@ -253,7 +242,7 @@ pub fn check_and_encode_args(
     }
 }
 
-pub fn check_explorer_args(source_code: ContractMetadata) -> Result<Bytes, eyre::ErrReport> {
+pub fn check_explorer_args(source_code: &ContractMetadata) -> Result<Bytes, eyre::ErrReport> {
     if let Some(args) = source_code.items.first() {
         Ok(args.constructor_arguments.clone())
     } else {
