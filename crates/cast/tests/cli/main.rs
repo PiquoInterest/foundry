@@ -3,7 +3,7 @@
 use alloy_chains::NamedChain;
 use alloy_eips::Decodable2718;
 use alloy_hardforks::EthereumHardfork;
-use alloy_network::{TransactionBuilder, TransactionResponse};
+use alloy_network::{ReceiptResponse, TransactionBuilder, TransactionResponse};
 use alloy_primitives::{Address, B256, Bytes, U256, address, b256, hex, keccak256};
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types::{
@@ -3146,6 +3146,40 @@ interface Interface {
     ]);
 });
 
+casttest!(interface_local_contract_does_not_write_artifacts, |prj, cmd| {
+    foundry_test_utils::util::initialize(prj.root());
+    prj.add_source(
+        "InterfaceTarget",
+        r#"
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.13;
+
+contract InterfaceTarget {
+    event ValueSet(uint256 value);
+
+    function setValue(uint256 value) external {
+        emit ValueSet(value);
+    }
+}
+    "#,
+    );
+
+    let source = prj.root().join("src/InterfaceTarget.sol");
+    let artifact = prj.root().join("out/InterfaceTarget.sol/InterfaceTarget.json");
+    let output =
+        cmd.cast_fuse().arg("interface").arg(&source).assert_success().get_output().stdout_lossy();
+    assert!(output.contains("interface InterfaceTarget"), "{output}");
+    assert!(output.contains("event ValueSet(uint256 value);"), "{output}");
+    assert!(!artifact.exists());
+
+    fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+    fs::write(&artifact, b"sentinel").unwrap();
+
+    cmd.cast_fuse().arg("interface").arg(&source).assert_success();
+    let after = fs::read(&artifact).unwrap();
+    assert_eq!(after, b"sentinel");
+});
+
 // tests that fetches WETH interface from etherscan
 // <https://etherscan.io/token/0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2>
 casttest!(flaky_fetch_weth_interface_from_etherscan, |_prj, cmd| {
@@ -3906,6 +3940,164 @@ forgetest_async!(cast_run_prestate_tracer_matches_block_replay, |prj, cmd| {
     assert_eq!(replay, prestate, "prestate tracer traces must match block replay traces");
 });
 
+// https://github.com/foundry-rs/foundry/issues/12336
+// `cast run --debug-trace-transaction` fetches the transaction's trace from the node via
+// `debug_traceTransaction` (callTracer) and renders it with the same decoding/rendering machinery
+// as the local replay, skipping local execution entirely: the block replay message must be absent
+// from stderr.
+forgetest_async!(cast_run_debug_trace_transaction, |prj, cmd| {
+    let (api, handle) = anvil::spawn(NodeConfig::test()).await;
+    let endpoint = handle.http_endpoint();
+    let tx_hash = deploy_counter_and_set_number(&prj, &mut cmd, &api, &endpoint).await;
+
+    let assert = cmd
+        .cast_fuse()
+        .args([
+            "run",
+            "--debug-trace-transaction",
+            format!("{tx_hash}").as_str(),
+            "--rpc-url",
+            &endpoint,
+        ])
+        .assert_success()
+        .stdout_eq(str![[r#"
+Traces:
+  [..] 0x5FbDB2315678afecb367f032d93F642f64180aa3::setNumber(111)
+    └─ ← [Return]
+
+
+Transaction successfully executed.
+[GAS]
+
+"#]]);
+    assert!(
+        !assert
+            .get_output()
+            .stderr_lossy()
+            .contains("Executing previous transactions from the block."),
+        "debug_traceTransaction path should not replay previous block transactions"
+    );
+    let receipt = api.transaction_receipt(tx_hash).await.unwrap().unwrap();
+    assert!(
+        assert.get_output().stdout_lossy().contains(&format!("Gas used: {}", receipt.gas_used())),
+        "debug_traceTransaction summary should report the receipt gas used"
+    );
+});
+
+// `cast run --debug-trace-transaction` must render a multi-node trace: the parent runtime emits a
+// LOG0 and then CALLs a child whose runtime reverts (the parent ignores the failure), exercising
+// the log/sub-call interleaving, nesting and revert rendering through the real pipeline.
+casttest!(cast_run_debug_trace_transaction_renders_nested_call_and_revert, async |_prj, cmd| {
+    let (api, handle) = anvil::spawn(NodeConfig::test()).await;
+
+    // Parent runtime: LOG0(0,0); CALL(gas, 0x..bb, 0,0,0,0,0); POP; STOP.
+    api.anvil_set_code(
+        address!("0x00000000000000000000000000000000000000aa"),
+        "0x60006000a0600060006000600060007300000000000000000000000000000000000000bb5af15000"
+            .parse()
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    // Child runtime: PUSH1 0 PUSH1 0 REVERT.
+    api.anvil_set_code(
+        address!("0x00000000000000000000000000000000000000bb"),
+        "0x60006000fd".parse().unwrap(),
+    )
+    .await
+    .unwrap();
+
+    cmd.cast_fuse()
+        .args([
+            "send",
+            "0x00000000000000000000000000000000000000aa",
+            "run()",
+            "--private-key",
+            "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+            "--rpc-url",
+            &handle.http_endpoint(),
+        ])
+        .assert_success();
+
+    let tx_hash = api
+        .transaction_by_block_number_and_index(BlockNumberOrTag::Latest, Index::from(0))
+        .await
+        .unwrap()
+        .unwrap()
+        .tx_hash();
+
+    cmd.cast_fuse()
+        .args([
+            "run",
+            "--debug-trace-transaction",
+            format!("{tx_hash}").as_str(),
+            "--rpc-url",
+            &handle.http_endpoint(),
+        ])
+        .assert_success()
+        .stdout_eq(str![[r#"
+Traces:
+  [..] 0x00000000000000000000000000000000000000AA::run()
+    ├─           data: 0x
+    ├─ [..] 0x00000000000000000000000000000000000000bb::fallback()
+    │   └─ ← [Revert] execution reverted
+    └─ ← [Return]
+
+
+Transaction successfully executed.
+[GAS]
+
+"#]]);
+});
+
+// `cast run --debug-trace-transaction --with-local-artifacts` labels the target contract by its
+// local artifact name (Counter::) instead of the raw address: the RPC path has no local executor,
+// so the bytecode for artifact matching must be fetched over RPC at the transaction's block.
+forgetest_async!(cast_run_debug_trace_transaction_with_local_artifacts, |prj, cmd| {
+    let (api, handle) = anvil::spawn(NodeConfig::test()).await;
+    let endpoint = handle.http_endpoint();
+    let tx_hash = deploy_counter_and_set_number(&prj, &mut cmd, &api, &endpoint).await;
+
+    cmd.cast_fuse();
+    cmd.set_current_dir(prj.root());
+    cmd.args([
+        "run",
+        "--debug-trace-transaction",
+        "--la",
+        format!("{tx_hash}").as_str(),
+        "--rpc-url",
+        &endpoint,
+    ])
+    .assert_success()
+    .stdout_eq(str![[r#"
+...
+Traces:
+  [..] Counter::setNumber(111)
+    └─ ← [Return]
+
+
+Transaction successfully executed.
+[GAS]
+
+"#]]);
+});
+
+// `--debug-trace-transaction` fetches the trace from the node, so the local-execution-only flags
+// must be rejected by clap.
+casttest!(cast_run_debug_trace_transaction_conflicts_with_debug, |_prj, cmd| {
+    cmd.args([
+        "run",
+        "0x0000000000000000000000000000000000000000000000000000000000000000",
+        "--debug-trace-transaction",
+        "--debug",
+    ])
+    .assert_failure()
+    .stderr_eq(str![[r#"
+error: the argument '--debug-trace-transaction' cannot be used with '--debug'
+...
+"#]]);
+});
+
 // tests cast can decode traces when running with verbosity level > 4
 forgetest_async!(show_state_changes_in_traces, |prj, cmd| {
     let (api, handle) = anvil::spawn(NodeConfig::test()).await;
@@ -4491,6 +4683,102 @@ forgetest_async!(cast_call_debug_trace_call_local_artifacts_json_stdout, |prj, c
     serde_json::from_str::<serde_json::Value>(output.trim()).unwrap_or_else(|err| {
         panic!("expected stdout to be a single JSON document ({err}):\n{output}")
     });
+});
+
+// `cast call --trace` decodes custom errors through the local signatures cache that `forge build`
+// populates, without requiring `--with-local-artifacts`.
+// <https://github.com/foundry-rs/foundry/issues/11085>
+forgetest_async!(flaky_cast_call_trace_decodes_error_from_signatures_cache, |prj, cmd| {
+    let (_, handle) = anvil::spawn(NodeConfig::test()).await;
+
+    foundry_test_utils::util::initialize(prj.root());
+    prj.add_source(
+        "CustomErrorContract",
+        r#"
+contract CustomErrorContract {
+    error WTF273987(uint256 a, uint256 b);
+    error PrintableError18();
+
+    function wtf2890230(uint256 a, uint128 b) external pure {
+        revert WTF273987(a, b);
+    }
+
+    function printableError() external pure {
+        revert PrintableError18();
+    }
+}
+"#,
+    );
+
+    // `forge build` caches the project's signatures, including custom errors.
+    cmd.args(["build"]).assert_success();
+
+    // Deploy the contract.
+    cmd.forge_fuse()
+        .args([
+            "create",
+            "./src/CustomErrorContract.sol:CustomErrorContract",
+            "--broadcast",
+            "--private-key",
+            "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+            "--rpc-url",
+            &handle.http_endpoint(),
+        ])
+        .assert_success();
+
+    // The revert reason is decoded from the cached signatures, even offline and without
+    // `--with-local-artifacts`.
+    cmd.cast_fuse().env("FOUNDRY_OFFLINE", "true");
+    cmd.args([
+        "call",
+        "0x5FbDB2315678afecb367f032d93F642f64180aa3",
+        "wtf2890230(uint256,uint128)",
+        "42",
+        "69",
+        "--trace",
+        "--rpc-url",
+        &handle.http_endpoint(),
+    ])
+    .assert_success()
+    .stdout_eq(str![[r#"
+Traces:
+  [..] 0x5FbDB2315678afecb367f032d93F642f64180aa3::wtf2890230(42, 69)
+    └─ ← [Revert] WTF273987(42, 69)
+
+
+[GAS]
+
+"#]])
+    .stderr_eq(str![[r#"
+Error: Transaction failed.
+
+"#]]);
+
+    // A custom error whose selector is valid ASCII must also be decoded from the cache rather than
+    // rendered as a raw string. `PrintableError18()` has selector `0x2e2c426f` (`.,Bo`).
+    cmd.cast_fuse().env("FOUNDRY_OFFLINE", "true");
+    cmd.args([
+        "call",
+        "0x5FbDB2315678afecb367f032d93F642f64180aa3",
+        "printableError()",
+        "--trace",
+        "--rpc-url",
+        &handle.http_endpoint(),
+    ])
+    .assert_success()
+    .stdout_eq(str![[r#"
+Traces:
+  [..] 0x5FbDB2315678afecb367f032d93F642f64180aa3::printableError()
+    └─ ← [Revert] PrintableError18()
+
+
+[GAS]
+
+"#]])
+    .stderr_eq(str![[r#"
+Error: Transaction failed.
+
+"#]]);
 });
 
 forgetest_async!(cast_call_custom_override, |prj, cmd| {
@@ -6306,6 +6594,36 @@ casttest!(cast_decode_tx_tempo, |_prj, cmd| {
 // Test decode-tx with invalid hex input
 casttest!(cast_decode_tx_invalid, |_prj, cmd| {
     cmd.args(["decode-tx", "0xinvalid"]).assert_failure();
+});
+
+// Test decode-tx auto-detects the Tempo network from the `0x76` type byte without `--network`,
+// producing the same output as passing `--network tempo` explicitly.
+casttest!(cast_decode_tx_tempo_autodetect, |_prj, cmd| {
+    let tx = "0x76f8cf82a5bf1485059682f018830494e5f85ef85c9420c0000000000000000000007d9cc57068833ea780b84440c10f190000000000000000000000008a871f4189067637cfc4cc1500abd6244bf1df740000000000000000000000000000000000000000000000000000000005f5e100c08082057e80809420c000000000000000000000000000000000000080c0b841eb100c4cbd96903bf9e97968c0982670bb90fc191ee4544c7ff32d44e901dbea3f6fbdd58255051135c2fe1aa81583a270d96009cbe375f4605ef15971273a4f1b";
+
+    let auto = cmd.args(["decode-tx", tx]).assert_success().get_output().stdout.clone();
+
+    let with_flag = cmd
+        .cast_fuse()
+        .args(["decode-tx", "--network", "tempo", tx])
+        .assert_success()
+        .get_output()
+        .stdout
+        .clone();
+
+    assert_eq!(auto, with_flag, "auto-detected and --network tempo output should match");
+
+    let output: String = serde_json::from_slice(&auto).unwrap();
+    let decoded: serde_json::Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(decoded["type"], "0x76");
+});
+
+// Test that `--network ethereum` forces Ethereum decoding and rejects a Tempo tx (type `0x76`),
+// so the flag remains a meaningful override rather than falling back to auto-detection.
+casttest!(cast_decode_tx_network_ethereum_rejects_tempo, |_prj, cmd| {
+    let tx = "0x76f8cf82a5bf1485059682f018830494e5f85ef85c9420c0000000000000000000007d9cc57068833ea780b84440c10f190000000000000000000000008a871f4189067637cfc4cc1500abd6244bf1df740000000000000000000000000000000000000000000000000000000005f5e100c08082057e80809420c000000000000000000000000000000000000080c0b841eb100c4cbd96903bf9e97968c0982670bb90fc191ee4544c7ff32d44e901dbea3f6fbdd58255051135c2fe1aa81583a270d96009cbe375f4605ef15971273a4f1b";
+
+    cmd.args(["decode-tx", "--network", "ethereum", tx]).assert_failure();
 });
 
 // Test that `--network tempo` and `-n tempo` (short form) produce identical output for decode-tx.
